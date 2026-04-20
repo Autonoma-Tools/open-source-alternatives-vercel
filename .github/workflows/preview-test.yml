@@ -1,0 +1,228 @@
+name: Autonoma E2E on self-hosted preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Optional: trigger via repository_dispatch from your PaaS webhook
+  # once the preview is fully deployed and reachable.
+  repository_dispatch:
+    types: [preview-ready]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  autonoma-e2e:
+    name: Run Autonoma E2E against preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------------
+      # Step 1: Resolve the preview URL.
+      #
+      # This is the ONLY step that differs between self-hosted PaaS
+      # platforms. Uncomment the block that matches your setup and
+      # delete the others. The remaining steps are identical.
+      # --------------------------------------------------------------
+      - name: Resolve preview URL
+        id: preview
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_URL: ${{ github.event.client_payload.preview_url }}
+        run: |
+          set -euo pipefail
+
+          # ---- Option A: Coolify ----------------------------------
+          # Coolify exposes preview deployments at a predictable
+          # hostname. Adjust COOLIFY_PREVIEW_HOST to your instance.
+          #
+          # PREVIEW_URL="https://pr-${PR_NUMBER}.preview.example.com"
+
+          # ---- Option B: Dokku ------------------------------------
+          # Dokku with the review-apps plugin creates an app per PR.
+          # Use your Dokku host and the review-app naming convention.
+          #
+          # PREVIEW_URL="https://myapp-pr-${PR_NUMBER}.dokku.example.com"
+
+          # ---- Option C: Kamal ------------------------------------
+          # Kamal itself does not manage preview envs. Teams usually
+          # deploy PR builds to a dedicated host keyed by PR number.
+          #
+          # PREVIEW_URL="https://pr-${PR_NUMBER}.preview.example.com"
+
+          # ---- Option D: CapRover ---------------------------------
+          # CapRover can deploy a per-PR app via its API. The app
+          # name convention here matches the CapRover deploy step
+          # you configured earlier in the workflow.
+          #
+          # PREVIEW_URL="https://pr-${PR_NUMBER}.caprover.example.com"
+
+          # ---- Option E: repository_dispatch from PaaS webhook ----
+          # If your PaaS calls GitHub with a repository_dispatch
+          # payload once the deploy succeeds, read the URL from it.
+          if [ -n "${DISPATCH_URL:-}" ]; then
+            PREVIEW_URL="$DISPATCH_URL"
+          fi
+
+          # Fallback: fail loudly if nothing was set above so a
+          # misconfigured workflow doesn't silently test the wrong
+          # URL.
+          if [ -z "${PREVIEW_URL:-}" ]; then
+            echo "::error::No preview URL resolved. Uncomment the block that matches your PaaS in .github/workflows/preview-test.yml or dispatch the workflow with client_payload.preview_url."
+            exit 1
+          fi
+
+          echo "Resolved preview URL: $PREVIEW_URL"
+          echo "preview_url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for preview to respond
+        env:
+          PREVIEW_URL: ${{ steps.preview.outputs.preview_url }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$PREVIEW_URL" || true)
+            if [ "$status" = "200" ] || [ "$status" = "301" ] || [ "$status" = "302" ]; then
+              echo "Preview responded with $status on attempt $attempt."
+              exit 0
+            fi
+            echo "Attempt $attempt: preview returned '$status', retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Preview at $PREVIEW_URL did not become reachable within 5 minutes."
+          exit 1
+
+      - name: Trigger Autonoma E2E run
+        id: trigger
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          AUTONOMA_PROJECT_ID: ${{ secrets.AUTONOMA_PROJECT_ID }}
+          PREVIEW_URL: ${{ steps.preview.outputs.preview_url }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${AUTONOMA_API_KEY:-}" ] || [ -z "${AUTONOMA_PROJECT_ID:-}" ]; then
+            echo "::error::AUTONOMA_API_KEY and AUTONOMA_PROJECT_ID must be set as repository secrets."
+            exit 1
+          fi
+
+          response=$(curl -sS -X POST "https://api.getautonoma.com/v1/runs" \
+            -H "Authorization: Bearer ${AUTONOMA_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"project_id\": \"${AUTONOMA_PROJECT_ID}\",
+              \"target_url\": \"${PREVIEW_URL}\",
+              \"metadata\": {
+                \"source\": \"github-actions\",
+                \"pr_number\": \"${PR_NUMBER}\",
+                \"commit_sha\": \"${COMMIT_SHA}\"
+              }
+            }")
+
+          run_id=$(echo "$response" | jq -r '.id // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::Autonoma API did not return a run id. Response: $response"
+            exit 1
+          fi
+
+          echo "Triggered Autonoma run: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Poll Autonoma run until it completes
+        id: poll
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          RUN_ID: ${{ steps.trigger.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Poll every 15s for up to 15 minutes.
+          deadline=$(( $(date +%s) + 900 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            response=$(curl -sS \
+              -H "Authorization: Bearer ${AUTONOMA_API_KEY}" \
+              "https://api.getautonoma.com/v1/runs/${RUN_ID}")
+
+            status=$(echo "$response" | jq -r '.status // "unknown"')
+            echo "Run ${RUN_ID} status: $status"
+
+            case "$status" in
+              passed|failed|errored|cancelled)
+                passed=$(echo "$response" | jq -r '.results.passed // 0')
+                failed=$(echo "$response" | jq -r '.results.failed // 0')
+                total=$(echo "$response" | jq -r '.results.total // 0')
+                report_url=$(echo "$response" | jq -r '.report_url // empty')
+
+                echo "status=$status" >> "$GITHUB_OUTPUT"
+                echo "passed=$passed" >> "$GITHUB_OUTPUT"
+                echo "failed=$failed" >> "$GITHUB_OUTPUT"
+                echo "total=$total" >> "$GITHUB_OUTPUT"
+                echo "report_url=$report_url" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              queued|running|pending)
+                sleep 15
+                ;;
+              *)
+                echo "::warning::Unknown status '$status', continuing to poll."
+                sleep 15
+                ;;
+            esac
+          done
+
+          echo "::error::Autonoma run ${RUN_ID} did not finish within 15 minutes."
+          exit 1
+
+      - name: Comment results on pull request
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          STATUS: ${{ steps.poll.outputs.status }}
+          PASSED: ${{ steps.poll.outputs.passed }}
+          FAILED: ${{ steps.poll.outputs.failed }}
+          TOTAL: ${{ steps.poll.outputs.total }}
+          REPORT_URL: ${{ steps.poll.outputs.report_url }}
+          PREVIEW_URL: ${{ steps.preview.outputs.preview_url }}
+          RUN_ID: ${{ steps.trigger.outputs.run_id }}
+        with:
+          script: |
+            const {
+              STATUS, PASSED, FAILED, TOTAL, REPORT_URL, PREVIEW_URL, RUN_ID,
+            } = process.env;
+
+            const icon = STATUS === 'passed' ? ':white_check_mark:' : ':x:';
+            const reportLine = REPORT_URL
+              ? `\n[View full report](${REPORT_URL})`
+              : '';
+
+            const body = [
+              `### ${icon} Autonoma E2E: \`${STATUS}\``,
+              '',
+              `**Preview:** ${PREVIEW_URL}`,
+              `**Run id:** \`${RUN_ID}\``,
+              `**Results:** ${PASSED}/${TOTAL} passed, ${FAILED} failed`,
+              reportLine,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      - name: Fail the job if tests did not pass
+        env:
+          STATUS: ${{ steps.poll.outputs.status }}
+        run: |
+          if [ "$STATUS" != "passed" ]; then
+            echo "::error::Autonoma run finished with status '$STATUS'."
+            exit 1
+          fi

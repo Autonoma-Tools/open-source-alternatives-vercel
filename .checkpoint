@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "slug": "open-source-alternatives-vercel",
-  "step": "templates_rendered",
-  "completed_specs": [],
-  "pending_specs": ["github-actions-preview-test"],
-  "created_at": "2026-04-20T14:07:33Z",
-  "updated_at": "2026-04-20T14:08:25Z"
-}
